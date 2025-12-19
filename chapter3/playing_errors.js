@@ -1,0 +1,45 @@
+import { time } from 'console';
+import EventEmitter from 'events';
+
+function ticker(number, cb) {
+  let ev = new EventEmitter();
+  let tickCount = 0;
+
+  const recursiveTimeout = () => setTimeout(() => {
+    if (tickCount * 50 >= number) {
+      ev.removeAllListeners('tick');
+      cb(null, tickCount)
+    } else {
+      const timestamp = Date.now();
+      if (timestamp % 5 === 0) {
+        const err =  new Error('Simulated error on tick')
+        ev.emit('error', err);
+        cb(err, null);
+      }
+      ev.emit('tick', ++tickCount);
+      recursiveTimeout()
+    }
+  }, 50);
+
+  recursiveTimeout();
+  process.nextTick(()=> { ev.emit('tick', tickCount); }); 
+  return ev;
+}
+
+ticker(200, (err, ticks) => {
+  if (err) {
+    console.error(err);
+  }
+  console.log(`Ticker finished after ${ticks} ticks.`);
+})
+.on('tick', (count) => {
+  console.log(`Tick ${count}`);
+})
+.on('tick', (count) => {
+  if (count === 3) {
+    console.log('Tick 3 reached, doing something special!');
+  }
+})
+.on('error', (err) => {
+  console.error(`Error event received: ${err.message}`);
+});

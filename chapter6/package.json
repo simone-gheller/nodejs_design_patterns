@@ -1,0 +1,19 @@
+{
+  "name": "chapter6",
+  "version": "1.0.0",
+  "main": "stream_test.js",
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "type": "module",
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "description": "",
+  "dependencies": {
+    "asciify-image": "^0.1.10",
+    "csv-parse": "^6.1.0",
+    "parse": "^8.0.0",
+    "unzipper": "^0.12.3"
+  }
+}

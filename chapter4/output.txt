@@ -1,0 +1,9 @@
+this is file1
+this is the second line of file1file2 desu
+hello
+worldthis is the last file (file3)
+
+the line above was blank
+final line
+
+ticker
