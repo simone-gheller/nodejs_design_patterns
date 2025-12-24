@@ -1,7 +1,7 @@
 import { createWriteStream } from 'fs'
 import { join } from 'path'
 
-const consoleStrategy = function (){
+export const consoleStrategy = function (){
   return {
     debug : (msg) => {
       console.debug(msg)
@@ -18,7 +18,7 @@ const consoleStrategy = function (){
   }
 }
 
-const fileStrategy = function (fileName) {
+export const fileStrategy = function (fileName) {
   const __dirname = import.meta.dirname
   const outputStream = createWriteStream(join(__dirname, fileName))
   return {
@@ -53,10 +53,12 @@ class LoggingConsole {
   error(msg) { this.strategy.error(msg) }
 }
 
-const logger = new LoggingConsole(consoleStrategy())
-logger.info('this is an info message')
-logger.error('this is an error message')
+if (import.meta.url == `file://${process.argv[1]}`) {
+  const logger = new LoggingConsole(consoleStrategy())
+  logger.info('this is an info message')
+  logger.error('this is an error message')
 
-const logger2 = new LoggingConsole(fileStrategy('my_log'))
-logger2.info('this is an info message')
-logger2.error('this is an error message')
+  const logger2 = new LoggingConsole(fileStrategy('my_log'))
+  logger2.info('this is an info message')
+  logger2.error('this is an error message')
+}
