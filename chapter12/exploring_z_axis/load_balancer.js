@@ -25,40 +25,20 @@ proxy.on('error', (err, req, res) => {
 })
 
 // Partition mapping: maps letter ranges to partition names
-const PARTITION_MAP = {
-  'A-D': { range: ['A', 'B', 'C', 'D'] },
-  'E-P': { range: ['E', 'F', 'G', 'H', 'I', 'J', 'K', 'L', 'M', 'N', 'O', 'P'] },
-  'Q-Z': { range: ['Q', 'R', 'S', 'T', 'U', 'V', 'W', 'X', 'Y', 'Z'] }
-}
-
-// Round-robin counter for each partition
-const roundRobinCounters = {
-  'A-D': 0,
-  'E-P': 0,
-  'Q-Z': 0
-}
-
-// Request tracking for auto-scaling
-const requestMetrics = {
-  'A-D': { count: 0, lastReset: Date.now() },
-  'E-P': { count: 0, lastReset: Date.now() },
-  'Q-Z': { count: 0, lastReset: Date.now() }
-}
-
+const PARTITION_MAP = [
+  { name: 'A-D', regex: /^[A-D]/i, rrCounter: 0, metrics_count: 0, metrics_lastReset: Date.now() },
+  { name: 'E-P', regex: /^[E-P]/i, rrCounter: 0, metrics_count: 0, metrics_lastReset: Date.now() },
+  { name: 'Q-Z', regex: /^[Q-Z]/i, rrCounter: 0, metrics_count: 0, metrics_lastReset: Date.now() },
+]
 /**
  * Get the partition name for a given letter
  */
 function getPartitionForLetter(letter) {
-  const upperLetter = letter.toUpperCase()
-
-  for (const [partition, config] of Object.entries(PARTITION_MAP)) {
-    if (config.range.includes(upperLetter)) {
-      return partition
-    }
-  }
-
-  return null
+  const partitionIndex = PARTITION_MAP.findIndex(group => group.regex.test(letter))
+  if (partitionIndex === -1) return null
+  return PARTITION_MAP[partitionIndex]
 }
+
 
 /**
  * Query Consul for healthy servers in a specific partition
@@ -94,10 +74,7 @@ function selectServer(servers, partition) {
   if (!servers || servers.length === 0) {
     return null
   }
-
-  const index = roundRobinCounters[partition] % servers.length
-  roundRobinCounters[partition]++
-
+  const index = partition.rrCounter++ % servers.length
   return servers[index]
 }
 
@@ -131,11 +108,11 @@ const server = createServer(async (req, res) => {
   // Metrics endpoint for monitoring
   if (req.url === '/metrics') {
     const metrics = {}
-    for (const [partition, data] of Object.entries(requestMetrics)) {
-      const timeElapsed = (Date.now() - data.lastReset) / 1000 // seconds
-      metrics[partition] = {
-        totalRequests: data.count,
-        requestsPerSecond: timeElapsed > 0 ? (data.count / timeElapsed).toFixed(2) : 0
+    for (const partition of PARTITION_MAP) {
+      const timeElapsed = (Date.now() - partition.metrics_lastReset) / 1000 // seconds
+      metrics[partition.name] = {
+        totalRequests: partition.metrics_count,
+        requestsPerSecond: timeElapsed > 0 ? (partition.metrics_count / timeElapsed).toFixed(2) : 0
       }
     }
     res.writeHead(200, { 'Content-Type': 'application/json' })
@@ -167,20 +144,20 @@ const server = createServer(async (req, res) => {
     return
   }
 
-  console.log(`[LOAD BALANCER] Letter '${letter}' mapped to partition '${partition}'`)
+  console.log(`[LOAD BALANCER] Letter '${letter}' mapped to partition '${partition.name}'`)
 
   // Track request for auto-scaling metrics
-  requestMetrics[partition].count++
+  partition.metrics_count++
 
   // Get healthy servers for this partition
-  const servers = await getServersForPartition(partition)
+  const servers = await getServersForPartition(partition.name)
 
   if (servers.length === 0) {
-    console.error(`[LOAD BALANCER] No healthy servers available for partition '${partition}'`)
+    console.error(`[LOAD BALANCER] No healthy servers available for partition '${partition.name}'`)
     res.writeHead(503, { 'Content-Type': 'application/json' })
     res.end(JSON.stringify({
       error: 'Service Unavailable',
-      message: `No servers available for partition ${partition}`
+      message: `No servers available for partition ${partition.name}`
     }))
     return
   }
@@ -201,8 +178,8 @@ server.listen(PORT, () => {
   console.log(`Load Balancer listening on http://localhost:${PORT}`)
   console.log(`Consul endpoint: ${CONSUL_HOST}:${CONSUL_PORT}`)
   console.log('Partition mapping:')
-  for (const [partition, config] of Object.entries(PARTITION_MAP)) {
-    console.log(`  ${partition}: ${config.range.join(', ')}`)
+  for (const partition of PARTITION_MAP) {
+    console.log(`  ${partition.name}: ${partition.regex}`)
   }
 })
 
