@@ -1,0 +1,26 @@
+{
+  "name": "dynamic-load-balancer",
+  "version": "1.0.0",
+  "description": "Dynamic Load Balancer with Consul Service Registry",
+  "type": "module",
+  "main": "load_balancer.js",
+  "scripts": {
+    "start:loadbalancer": "node load_balancer.js",
+    "start:api": "node api_server.js"
+  },
+  "keywords": [
+    "load-balancer",
+    "consul",
+    "service-registry",
+    "microservices"
+  ],
+  "author": "",
+  "license": "ISC",
+  "dependencies": {
+    "consul": "^1.2.0",
+    "http-proxy": "^1.18.1",
+    "portfinder": "^1.0.32",
+    "sqlite": "^5.1.1",
+    "sqlite3": "^5.1.7"
+  }
+}

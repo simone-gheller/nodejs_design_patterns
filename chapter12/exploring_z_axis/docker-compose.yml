@@ -1,0 +1,110 @@
+version: '3.8'
+
+services:
+  # Consul Service Registry
+  consul:
+    image: consul:1.15
+    ports:
+      - "8500:8500"
+      - "8600:8600/udp"
+    command: agent -server -ui -bootstrap-expect=1 -client=0.0.0.0
+    networks:
+      - app-network
+    healthcheck:
+      test: ["CMD", "consul", "members"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+
+  # Load Balancer (Main App)
+  load-balancer:
+    build: .
+    ports:
+      - "8080:8080"
+    environment:
+      - PORT=8080
+      - CONSUL_HOST=consul
+      - CONSUL_PORT=8500
+    command: node load_balancer.js
+    depends_on:
+      consul:
+        condition: service_healthy
+    networks:
+      - app-network
+    restart: unless-stopped
+
+  # Auto-scaler for dynamic scaling
+  auto-scaler:
+    build:
+      context: .
+      dockerfile: Dockerfile.autoscaler
+    environment:
+      - LOAD_BALANCER_HOST=load-balancer
+      - LOAD_BALANCER_PORT=8080
+      - CONSUL_HOST=consul
+      - CONSUL_PORT=8500
+      - SCALE_UP_THRESHOLD=10
+      - SCALE_DOWN_THRESHOLD=2
+      - MIN_INSTANCES=1
+      - MAX_INSTANCES=5
+      - CHECK_INTERVAL=30000
+    command: node auto_scaler.js
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - .:/app
+    working_dir: /app
+    depends_on:
+      - load-balancer
+      - consul
+    networks:
+      - app-network
+    restart: unless-stopped
+
+  # API Server for partition A-D
+  api-server-ad:
+    build: .
+    environment:
+      - PARTITION=A-D
+      - CONSUL_HOST=consul
+      - CONSUL_PORT=8500
+    command: node api_server.js A-D.db
+    depends_on:
+      consul:
+        condition: service_healthy
+    networks:
+      - app-network
+    restart: unless-stopped
+
+  # API Server for partition E-P
+  api-server-ep:
+    build: .
+    environment:
+      - PARTITION=E-P
+      - CONSUL_HOST=consul
+      - CONSUL_PORT=8500
+    command: node api_server.js E-P.db
+    depends_on:
+      consul:
+        condition: service_healthy
+    networks:
+      - app-network
+    restart: unless-stopped
+
+  # API Server for partition Q-Z
+  api-server-qz:
+    build: .
+    environment:
+      - PARTITION=Q-Z
+      - CONSUL_HOST=consul
+      - CONSUL_PORT=8500
+    command: node api_server.js Q-Z.db
+    depends_on:
+      consul:
+        condition: service_healthy
+    networks:
+      - app-network
+    restart: unless-stopped
+
+networks:
+  app-network:
+    driver: bridge
