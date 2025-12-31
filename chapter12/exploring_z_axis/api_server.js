@@ -3,16 +3,18 @@ import { createServer } from 'http'
 import { getPortPromise } from 'portfinder'
 import { SqliteDAO } from './dao.js'
 import { pid } from 'process'
-import { hostname } from 'os'
+import { hostname, cpus, freemem, totalmem } from 'os'
 import Consul from 'consul'
 
-const PORT = await getPortPromise()
+const PORT = process.env.PORT ? parseInt(process.env.PORT) : await getPortPromise()
 const DB_NAME = process.argv[2]
 const PARTITION = process.env.PARTITION || DB_NAME.replace('.db', '')
 const CONSUL_HOST = process.env.CONSUL_HOST || 'localhost'
 const CONSUL_PORT = process.env.CONSUL_PORT || 8500
 const HOST_NAME = hostname()
-const SERVICE_ID = `api-server-${PARTITION}-${HOST_NAME}-${PORT}`
+// Service name includes partition for DNS lookup
+const SERVICE_NAME = `api-server-${PARTITION}`
+const SERVICE_ID = `${SERVICE_NAME}-${HOST_NAME}-${PORT}`
 
 const db_dao = new SqliteDAO(DB_NAME)
 
@@ -28,6 +30,30 @@ const server = createServer(async (req, res) => {
   if (req.url === '/health') {
     res.writeHead(200, { 'Content-Type': 'application/json' })
     res.end(JSON.stringify({ status: 'healthy', partition: PARTITION, pid }))
+    return
+  }
+
+  if (req.url === '/metrics') {
+    const totalMemory = totalmem()
+    const usedMemory = totalMemory - freemem()
+
+    // Calculate average CPU usage across all cores
+    const cpuInfo = cpus()
+    const avgCpuUsage = cpuInfo.reduce((acc, cpu) => {
+      const total = Object.values(cpu.times).reduce((sum, time) => sum + time, 0)
+      const idle = cpu.times.idle
+      const usage = (1 - idle / total) * 100
+      return acc + usage
+    }, 0) / cpuInfo.length
+
+    const metrics = {
+      memoryTotal: totalMemory,
+      memoryUsed: usedMemory,
+      cpuUsagePercent: parseFloat(avgCpuUsage.toFixed(2))
+    }
+
+    res.writeHead(200, { 'Content-Type': 'application/json' })
+    res.end(JSON.stringify(metrics))
     return
   }
 
@@ -69,10 +95,9 @@ server.listen(PORT, async () => {
   try {
     await consul.agent.service.register({
       id: SERVICE_ID,
-      name: 'api-server',
+      name: SERVICE_NAME,  // Each partition is a separate service
       address: serviceAddress,
       port: PORT,
-      tags: [`partition:${PARTITION}`],
       meta: {
         partition: PARTITION,
         database: DB_NAME
@@ -83,7 +108,12 @@ server.listen(PORT, async () => {
         timeout: '5s'
       }
     })
-    console.log(`Registered with Consul as ${SERVICE_ID} at ${serviceAddress}:${PORT}`)
+    console.log(`Registered with Consul as ${SERVICE_NAME} (ID: ${SERVICE_ID}) at ${serviceAddress}:${PORT}`)
+
+    // Notify parent process that we're ready (if spawned by auto_scaler)
+    if (process.send) {
+      process.send('ready')
+    }
   } catch (err) {
     console.error('Failed to register with Consul:', err)
     process.exit(1)

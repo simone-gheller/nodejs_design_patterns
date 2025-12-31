@@ -42,20 +42,17 @@ function getPartitionForLetter(letter) {
 
 /**
  * Query Consul for healthy servers in a specific partition
+ * Each partition is now a separate service: api-server-A-D, api-server-E-P, api-server-Q-Z
  */
 async function getServersForPartition(partition) {
   try {
+    const serviceName = `api-server-${partition}`
     const services = await consul.health.service({
-      service: 'api-server',
+      service: serviceName,
       passing: true
     })
 
-    // Filter services by partition tag
-    const partitionServers = services.filter(service => {
-      return service.Service.Tags.includes(`partition:${partition}`)
-    })
-
-    return partitionServers.map(s => ({
+    return services.map(s => ({
       address: s.Service.Address,
       port: s.Service.Port,
       id: s.Service.ID,
