@@ -1,58 +1,12 @@
 import { request } from 'http'
-import Consul from 'consul'
-import { fork } from 'child_process'
-import { fileURLToPath } from 'url'
-import { dirname, join } from 'path'
-import { getPortPromise } from 'portfinder'
+import { createLogger } from './logger.js'
+import { PARTITIONS, CONSUL_CONFIG, SCALING_CONFIG } from './config.js'
+import { createConsulClient, getServersForPartition } from './consul_client.js'
 
-const __filename = fileURLToPath(import.meta.url)
-const __dirname = dirname(__filename)
-
-const CONSUL_HOST = process.env.CONSUL_HOST || 'localhost'
-const CONSUL_PORT = process.env.CONSUL_PORT || 8500
-
-// Scaling thresholds
-const CPU_THRESHOLD = parseFloat(process.env.CPU_THRESHOLD || '70') // CPU %
-const MEMORY_THRESHOLD = parseFloat(process.env.MEMORY_THRESHOLD || '80') // Memory %
-const MIN_INSTANCES = parseInt(process.env.MIN_INSTANCES || '1')
-const MAX_INSTANCES = parseInt(process.env.MAX_INSTANCES || '5')
-const CHECK_INTERVAL = parseInt(process.env.CHECK_INTERVAL || '30000') // 30 seconds
-
-// Partition configuration
-const PARTITIONS = ['A-D', 'E-P', 'Q-Z']
-
-// Track spawned processes
-const processes = new Map() // partition -> [process objects]
+const logger = createLogger('AUTO-SCALER', 'auto_scaler.log')
 
 // Initialize Consul client
-const consul = new Consul({
-  host: CONSUL_HOST,
-  port: CONSUL_PORT,
-  promisify: true
-})
-
-/**
- * Get all healthy servers for a partition from Consul
- */
-async function getServersForPartition(partition) {
-  try {
-    const serviceName = `api-server-${partition}`
-    const services = await consul.health.service({
-      service: serviceName,
-      passing: true
-    })
-
-    return services.map(s => ({
-      address: s.Service.Address,
-      port: s.Service.Port,
-      id: s.Service.ID,
-      partition: partition
-    }))
-  } catch (err) {
-    console.error(`[AUTO-SCALER] Error querying Consul for ${partition}:`, err.message)
-    return []
-  }
-}
+const consul = createConsulClient()
 
 /**
  * Fetch metrics from a specific server
@@ -92,8 +46,8 @@ async function fetchMetrics(server) {
 /**
  * Calculate average metrics across all servers in a partition
  */
-async function getPartitionMetrics(partition) {
-  const servers = await getServersForPartition(partition)
+async function getPartitionMetrics(partitionName) {
+  const servers = await getServersForPartition(consul, partitionName)
 
   if (servers.length === 0) {
     return null
@@ -103,7 +57,7 @@ async function getPartitionMetrics(partition) {
     try {
       return await fetchMetrics(server)
     } catch (err) {
-      console.error(`[AUTO-SCALER] Failed to fetch metrics from ${server.id}:`, err.message)
+      logger.error(`Failed to fetch metrics from ${server.id}: ${err.message}`)
       return null
     }
   })
@@ -129,68 +83,61 @@ async function getPartitionMetrics(partition) {
 }
 
 /**
- * Spawn a new worker process for a partition
+ * Request cluster manager to spawn a worker
  */
-async function spawnWorker(partition) {
-  const dbName = `${partition}.db`  // DAO adds 'db/' prefix automatically
-  const port = await getPortPromise()
-
+function requestScaleUp(partition) {
   return new Promise((resolve) => {
-    const child = fork(join(__dirname, 'api_server.js'), [dbName], {
-      env: {
-        ...process.env,
-        PARTITION: partition,
-        DB_NAME: dbName,
-        PORT: port.toString()
-      },
-      stdio: ['inherit', 'inherit', 'inherit', 'ipc']
-    })
+    const timeout = setTimeout(() => {
+      logger.warn(`Scale up request for ${partition} timed out`)
+      resolve(false)
+    }, 5000)
 
-    child.on('exit', (code, signal) => {
-      console.log(`[AUTO-SCALER] Worker for ${partition} exited (${signal || code})`)
-
-      // Remove from tracking
-      const partitionProcs = processes.get(partition) || []
-      const index = partitionProcs.indexOf(child)
-      if (index > -1) {
-        partitionProcs.splice(index, 1)
+    const handler = (msg) => {
+      if (msg.action === 'SCALE_UP_SUCCESS' && msg.partition === partition) {
+        clearTimeout(timeout)
+        process.off('message', handler)
+        logger.info(`Scale up successful for ${partition}, worker ID: ${msg.workerId}`)
+        resolve(true)
+      } else if (msg.action === 'SCALE_UP_FAILED' && msg.partition === partition) {
+        clearTimeout(timeout)
+        process.off('message', handler)
+        logger.error(`Scale up failed for ${partition}`)
+        resolve(false)
       }
-    })
-
-    // Wait for worker to signal it's ready
-    child.once('message', (msg) => {
-      if (msg === 'ready') {
-        console.log(`[AUTO-SCALER] Worker ${child.pid} for partition ${partition} ready on port ${port}`)
-        resolve(child)
-      }
-    })
-
-    // Track process
-    if (!processes.has(partition)) {
-      processes.set(partition, [])
     }
-    processes.get(partition).push(child)
 
-    console.log(`[AUTO-SCALER] Spawned worker ${child.pid} for partition ${partition} on port ${port}`)
+    process.on('message', handler)
+    process.send({ action: 'SCALE_UP', partition })
   })
 }
 
 /**
- * Kill a worker for a partition
+ * Request cluster manager to kill a worker
  */
-function killWorker(partition) {
-  const partitionProcs = processes.get(partition) || []
+function requestScaleDown(partition) {
+  return new Promise((resolve) => {
+    const timeout = setTimeout(() => {
+      logger.warn(`Scale down request for ${partition} timed out`)
+      resolve(false)
+    }, 5000)
 
-  if (partitionProcs.length === 0) {
-    console.error(`[AUTO-SCALER] No workers to kill for partition ${partition}`)
-    return false
-  }
+    const handler = (msg) => {
+      if (msg.action === 'SCALE_DOWN_SUCCESS' && msg.partition === partition) {
+        clearTimeout(timeout)
+        process.off('message', handler)
+        logger.info(`Scale down successful for ${partition}`)
+        resolve(true)
+      } else if (msg.action === 'SCALE_DOWN_FAILED' && msg.partition === partition) {
+        clearTimeout(timeout)
+        process.off('message', handler)
+        logger.error(`Scale down failed for ${partition}`)
+        resolve(false)
+      }
+    }
 
-  // Kill the last spawned worker
-  const worker = partitionProcs.pop()
-  console.log(`[AUTO-SCALER] Killing worker ${worker.pid} for partition ${partition}`)
-  worker.kill()
-  return true
+    process.on('message', handler)
+    process.send({ action: 'SCALE_DOWN', partition })
+  })
 }
 
 /**
@@ -198,23 +145,26 @@ function killWorker(partition) {
  */
 async function makeScalingDecision(partition, metrics) {
   if (!metrics) {
-    console.log(`[AUTO-SCALER] No metrics available for ${partition}`)
+    logger.info(`No metrics available for ${partition}`)
     return
   }
 
   const { instanceCount, avgCpu, avgMemoryPercent } = metrics
 
-  console.log(`[AUTO-SCALER] ${partition}: ${instanceCount} instances, CPU: ${avgCpu}%, Memory: ${avgMemoryPercent}%`)
+  logger.info(`${partition}: ${instanceCount} instances, CPU: ${avgCpu}%, Memory: ${avgMemoryPercent}%`)
 
   // Scale up if CPU or Memory exceed thresholds
-  if ((avgCpu > CPU_THRESHOLD || avgMemoryPercent > MEMORY_THRESHOLD) && instanceCount < MAX_INSTANCES) {
-    console.log(`[AUTO-SCALER] 🔼 Scaling UP ${partition}: ${instanceCount} -> ${instanceCount + 1}`)
-    await spawnWorker(partition)
+  if ((avgCpu > SCALING_CONFIG.cpuThreshold || avgMemoryPercent > SCALING_CONFIG.memoryThreshold) &&
+      instanceCount < SCALING_CONFIG.maxInstances) {
+    logger.info(`Scaling UP ${partition}: ${instanceCount} -> ${instanceCount + 1}`)
+    await requestScaleUp(partition)
   }
   // Scale down if both CPU and Memory are low
-  else if (avgCpu < CPU_THRESHOLD / 2 && avgMemoryPercent < MEMORY_THRESHOLD / 2 && instanceCount > MIN_INSTANCES) {
-    console.log(`[AUTO-SCALER] 🔽 Scaling DOWN ${partition}: ${instanceCount} -> ${instanceCount - 1}`)
-    killWorker(partition)
+  else if (avgCpu < SCALING_CONFIG.cpuThreshold / 2 &&
+           avgMemoryPercent < SCALING_CONFIG.memoryThreshold / 2 &&
+           instanceCount > SCALING_CONFIG.minInstances) {
+    logger.info(`Scaling DOWN ${partition}: ${instanceCount} -> ${instanceCount - 1}`)
+    await requestScaleDown(partition)
   }
 }
 
@@ -223,48 +173,39 @@ async function makeScalingDecision(partition, metrics) {
  */
 async function monitorAndScale() {
   try {
-    console.log('\n[AUTO-SCALER] Checking metrics...')
+    logger.debug('Checking metrics...')
 
     for (const partition of PARTITIONS) {
-      const metrics = await getPartitionMetrics(partition)
-      await makeScalingDecision(partition, metrics)
+      const metrics = await getPartitionMetrics(partition.name)
+      await makeScalingDecision(partition.name, metrics)
     }
   } catch (err) {
-    console.error('[AUTO-SCALER] Error in monitoring loop:', err.message)
+    logger.error(`Error in monitoring loop: ${err.message}`)
   }
 }
 
-// Start monitoring
-console.log('[AUTO-SCALER] Starting auto-scaler...')
-console.log(`[AUTO-SCALER] Consul: ${CONSUL_HOST}:${CONSUL_PORT}`)
-console.log(`[AUTO-SCALER] CPU threshold: ${CPU_THRESHOLD}%`)
-console.log(`[AUTO-SCALER] Memory threshold: ${MEMORY_THRESHOLD}%`)
-console.log(`[AUTO-SCALER] Instance limits: ${MIN_INSTANCES}-${MAX_INSTANCES}`)
-console.log(`[AUTO-SCALER] Check interval: ${CHECK_INTERVAL}ms`)
+/**
+ * Start the auto-scaler (called by cluster_manager when worker is forked)
+ */
+export async function startAutoScaler() {
+  logger.info('Auto-scaler starting...')
+  logger.info(`Consul: ${CONSUL_CONFIG.host}:${CONSUL_CONFIG.port}`)
+  logger.info(`CPU threshold: ${SCALING_CONFIG.cpuThreshold}%`)
+  logger.info(`Memory threshold: ${SCALING_CONFIG.memoryThreshold}%`)
+  logger.info(`Instance limits: ${SCALING_CONFIG.minInstances}-${SCALING_CONFIG.maxInstances}`)
+  logger.info(`Check interval: ${SCALING_CONFIG.checkInterval}ms`)
 
-// Spawn initial workers
-console.log('\n[AUTO-SCALER] Spawning initial workers...')
-for (const partition of PARTITIONS) {
-  await spawnWorker(partition)
+  // Wait a bit for initial workers to register with Consul
+  await new Promise(resolve => setTimeout(resolve, 5000))
+
+  // Run monitoring at intervals
+  const intervalId = setInterval(monitorAndScale, SCALING_CONFIG.checkInterval)
+
+  // Graceful shutdown
+  process.on('SIGTERM', () => {
+    logger.info('Received SIGTERM, shutting down...')
+    clearInterval(intervalId)
+  })
+
+  logger.info('Auto-scaler ready')
 }
-
-// Run monitoring at intervals
-setInterval(monitorAndScale, CHECK_INTERVAL)
-
-// Graceful shutdown
-function shutdown() {
-  console.log('\n[AUTO-SCALER] Shutting down...')
-
-  for (const [partition, procs] of processes.entries()) {
-    console.log(`[AUTO-SCALER] Killing ${procs.length} workers for ${partition}`)
-    procs.forEach(proc => proc.kill())
-  }
-
-  setTimeout(() => {
-    console.log('[AUTO-SCALER] All workers stopped')
-    process.exit(0)
-  }, 2000)
-}
-
-process.on('SIGINT', shutdown)
-process.on('SIGTERM', shutdown)

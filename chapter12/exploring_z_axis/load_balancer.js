@@ -1,76 +1,43 @@
 import { createServer } from 'http'
 import httpProxy from 'http-proxy'
-import Consul from 'consul'
+import os from 'os'
+import { createLogger } from './logger.js'
+import { PARTITIONS, CONSUL_CONFIG, getPartitionForLetter } from './config.js'
+import { createConsulClient, getServersForPartition, registerService, deregisterService } from './consul_client.js'
+
+const logger = createLogger('LOAD-BALANCER', 'load_balancer.log')
 
 const PORT = process.env.PORT || 8080
-const CONSUL_HOST = process.env.CONSUL_HOST || 'localhost'
-const CONSUL_PORT = process.env.CONSUL_PORT || 8500
+const SERVICE_ID = `load-balancer-${os.hostname()}-${PORT}`
+const SERVICE_NAME = 'load-balancer'
 
 // Initialize Consul client
-const consul = new Consul({
-  host: CONSUL_HOST,
-  port: CONSUL_PORT,
-  promisify: true
-})
+const consul = createConsulClient()
 
 // Initialize HTTP proxy
 const proxy = httpProxy.createProxyServer({})
 
 proxy.on('error', (err, req, res) => {
-  console.error('Proxy error:', err)
+  logger.error('Proxy error:', err)
   if (!res.headersSent) {
     res.writeHead(502, { 'Content-Type': 'application/json' })
     res.end(JSON.stringify({ error: 'Bad Gateway' }))
   }
 })
 
-// Partition mapping: maps letter ranges to partition names
-const PARTITION_MAP = [
-  { name: 'A-D', regex: /^[A-D]/i, rrCounter: 0, metrics_count: 0, metrics_lastReset: Date.now() },
-  { name: 'E-P', regex: /^[E-P]/i, rrCounter: 0, metrics_count: 0, metrics_lastReset: Date.now() },
-  { name: 'Q-Z', regex: /^[Q-Z]/i, rrCounter: 0, metrics_count: 0, metrics_lastReset: Date.now() },
-]
-/**
- * Get the partition name for a given letter
- */
-function getPartitionForLetter(letter) {
-  const partitionIndex = PARTITION_MAP.findIndex(group => group.regex.test(letter))
-  if (partitionIndex === -1) return null
-  return PARTITION_MAP[partitionIndex]
-}
-
-
-/**
- * Query Consul for healthy servers in a specific partition
- * Each partition is now a separate service: api-server-A-D, api-server-E-P, api-server-Q-Z
- */
-async function getServersForPartition(partition) {
-  try {
-    const serviceName = `api-server-${partition}`
-    const services = await consul.health.service({
-      service: serviceName,
-      passing: true
-    })
-
-    return services.map(s => ({
-      address: s.Service.Address,
-      port: s.Service.Port,
-      id: s.Service.ID,
-      partition: partition
-    }))
-  } catch (err) {
-    console.error(`Error querying Consul for partition ${partition}:`, err)
-    return []
-  }
-}
+// Partition mapping with round-robin counters and metrics
+const PARTITION_MAP = PARTITIONS.map(p => ({
+  ...p,
+  rrCounter: 0,
+  metrics_count: 0,
+  metrics_lastReset: Date.now()
+}))
 
 /**
  * Select a server using round-robin strategy
  */
 function selectServer(servers, partition) {
-  if (!servers || servers.length === 0) {
-    return null
-  }
+  if (!servers || servers.length === 0) return null
   const index = partition.rrCounter++ % servers.length
   return servers[index]
 }
@@ -80,8 +47,7 @@ function selectServer(servers, partition) {
  */
 function proxyRequest(backendServer, req, res) {
   const target = `http://${backendServer.address}:${backendServer.port}`
-
-  console.log(`[LOAD BALANCER] Proxying to ${target}`)
+  logger.info(`Proxying to ${target}`)
 
   proxy.web(req, res, {
     target: target,
@@ -90,104 +56,123 @@ function proxyRequest(backendServer, req, res) {
 }
 
 /**
- * Main load balancer server
+ * Start the load balancer (can be called by cluster_manager or standalone)
  */
-const server = createServer(async (req, res) => {
-  console.log(`[LOAD BALANCER] ${req.method} ${req.url}`)
+export async function startLoadBalancer() {
+  const server = createServer(async (req, res) => {
+    logger.info(`${req.method} ${req.url}`)
 
-  // Health check endpoint
-  if (req.url === '/health') {
-    res.writeHead(200, { 'Content-Type': 'application/json' })
-    res.end(JSON.stringify({ status: 'healthy', service: 'load-balancer' }))
-    return
-  }
-
-  // Metrics endpoint for monitoring
-  if (req.url === '/metrics') {
-    const metrics = {}
-    for (const partition of PARTITION_MAP) {
-      const timeElapsed = (Date.now() - partition.metrics_lastReset) / 1000 // seconds
-      metrics[partition.name] = {
-        totalRequests: partition.metrics_count,
-        requestsPerSecond: timeElapsed > 0 ? (partition.metrics_count / timeElapsed).toFixed(2) : 0
-      }
+    // Health check endpoint
+    if (req.url === '/health') {
+      res.writeHead(200, { 'Content-Type': 'application/json' })
+      res.end(JSON.stringify({ status: 'healthy', service: 'load-balancer' }))
+      return
     }
-    res.writeHead(200, { 'Content-Type': 'application/json' })
-    res.end(JSON.stringify(metrics))
-    return
-  }
 
-  // Parse request to extract the letter
-  if (!req.url.startsWith('/api/people/byLastName/')) {
-    res.writeHead(400, { 'Content-Type': 'application/json' })
-    res.end(JSON.stringify({ error: 'Invalid request path' }))
-    return
-  }
+    // Metrics endpoint for monitoring
+    if (req.url === '/metrics') {
+      const metrics = {}
+      for (const partition of PARTITION_MAP) {
+        const timeElapsed = (Date.now() - partition.metrics_lastReset) / 1000 // seconds
+        metrics[partition.name] = {
+          totalRequests: partition.metrics_count,
+          requestsPerSecond: timeElapsed > 0 ? (partition.metrics_count / timeElapsed).toFixed(2) : 0
+        }
+      }
+      res.writeHead(200, { 'Content-Type': 'application/json' })
+      res.end(JSON.stringify(metrics))
+      return
+    }
 
-  const letter = req.url.split('/').at(-1)
+    // Parse request to extract the letter
+    if (!req.url.startsWith('/api/people/byLastName/')) {
+      res.writeHead(400, { 'Content-Type': 'application/json' })
+      res.end(JSON.stringify({ error: 'Invalid request path' }))
+      return
+    }
 
-  if (!letter || letter.length === 0) {
-    res.writeHead(400, { 'Content-Type': 'application/json' })
-    res.end(JSON.stringify({ error: 'Letter parameter is required' }))
-    return
-  }
+    const letter = req.url.split('/').at(-1)
+    // Determine which partition to use
+    const partitionConfig = getPartitionForLetter(letter)
 
-  // Determine which partition to use
-  const partition = getPartitionForLetter(letter)
+    if (!partitionConfig) {
+      res.writeHead(400, { 'Content-Type': 'application/json' })
+      res.end(JSON.stringify({ error: `No partition found for letter: ${letter}` }))
+      return
+    }
 
-  if (!partition) {
-    res.writeHead(400, { 'Content-Type': 'application/json' })
-    res.end(JSON.stringify({ error: `No partition found for letter: ${letter}` }))
-    return
-  }
+    const partition = PARTITION_MAP.find(p => p.name === partitionConfig.name)
+    logger.info(`Letter '${letter}' mapped to partition '${partition.name}'`)
+    partition.metrics_count++
+    const servers = await getServersForPartition(consul, partition.name)
 
-  console.log(`[LOAD BALANCER] Letter '${letter}' mapped to partition '${partition.name}'`)
+    if (servers.length === 0) {
+      logger.error(`No healthy servers available for partition '${partition.name}'`)
+      res.writeHead(503, { 'Content-Type': 'application/json' })
+      res.end(JSON.stringify({
+        error: 'Service Unavailable',
+        message: `No servers available for partition ${partition.name}`
+      }))
+      return
+    }
 
-  // Track request for auto-scaling metrics
-  partition.metrics_count++
+    // Select a server using round-robin
+    const selectedServer = selectServer(servers, partition)
+    logger.info(`Selected server: ${selectedServer.id} (${selectedServer.address}:${selectedServer.port})`)
 
-  // Get healthy servers for this partition
-  const servers = await getServersForPartition(partition.name)
-
-  if (servers.length === 0) {
-    console.error(`[LOAD BALANCER] No healthy servers available for partition '${partition.name}'`)
-    res.writeHead(503, { 'Content-Type': 'application/json' })
-    res.end(JSON.stringify({
-      error: 'Service Unavailable',
-      message: `No servers available for partition ${partition.name}`
-    }))
-    return
-  }
-
-  // Select a server using round-robin
-  const selectedServer = selectServer(servers, partition)
-  console.log(`[LOAD BALANCER] Selected server: ${selectedServer.id} (${selectedServer.address}:${selectedServer.port})`)
-
-  // Proxy the request to the selected server
-  proxyRequest(selectedServer, req, res)
-})
-
-server.on('error', (err) => {
-  console.error('Load balancer error:', err)
-})
-
-server.listen(PORT, () => {
-  console.log(`Load Balancer listening on http://localhost:${PORT}`)
-  console.log(`Consul endpoint: ${CONSUL_HOST}:${CONSUL_PORT}`)
-  console.log('Partition mapping:')
-  for (const partition of PARTITION_MAP) {
-    console.log(`  ${partition.name}: ${partition.regex}`)
-  }
-})
-
-// Graceful shutdown
-function shutdown() {
-  console.log('\nShutting down load balancer...')
-  server.close(() => {
-    console.log('Load balancer closed')
-    process.exit(0)
+    proxyRequest(selectedServer, req, res)
   })
+
+  server.on('error', (err) => {
+    logger.error('Load balancer error:', err)
+  })
+
+  server.listen(PORT, async () => {
+    logger.info(`Load Balancer listening on http://localhost:${PORT}`)
+    logger.info(`Consul endpoint: ${CONSUL_CONFIG.host}:${CONSUL_CONFIG.port}`)
+
+    // Register with Consul
+    try {
+      const serviceAddress = os.hostname()
+      await registerService(consul, {
+        id: SERVICE_ID,
+        name: SERVICE_NAME,
+        address: serviceAddress,
+        port: PORT,
+        meta: { role: 'load-balancer' },
+        healthCheckPath: '/health'
+      })
+      logger.info(`Registered with Consul as ${SERVICE_NAME} (ID: ${SERVICE_ID}) at ${serviceAddress}:${PORT}`)
+    } catch (err) {
+      logger.error('Failed to register with Consul:', err)
+    }
+  })
+
+  // Graceful shutdown
+  async function shutdown() {
+    logger.info('Shutting down load balancer...')
+
+    // Deregister from Consul
+    try {
+      await deregisterService(consul, SERVICE_ID)
+      logger.info('Deregistered from Consul')
+    } catch (err) {
+      logger.error('Failed to deregister from Consul:', err)
+    }
+
+    server.close(() => {
+      logger.info('Load balancer closed')
+      process.exit(0)
+    })
+  }
+
+  process.on('SIGINT', shutdown)
+  process.on('SIGTERM', shutdown)
+
+  logger.info('Load balancer ready')
 }
 
-process.on('SIGINT', shutdown)
-process.on('SIGTERM', shutdown)
+// If running as standalone script (not imported as module)
+if (import.meta.url === `file://${process.argv[1]}`) {
+  startLoadBalancer()
+}

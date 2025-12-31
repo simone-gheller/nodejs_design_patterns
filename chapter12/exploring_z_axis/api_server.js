@@ -1,29 +1,30 @@
-
 import { createServer } from 'http'
-import { getPortPromise } from 'portfinder'
 import { SqliteDAO } from './dao.js'
 import { pid } from 'process'
 import { hostname, cpus, freemem, totalmem } from 'os'
-import Consul from 'consul'
+import { createLogger } from './logger.js'
+import { SERVICE_NAME_TEMPLATE } from './config.js'
+import { createConsulClient, registerService, deregisterService } from './consul_client.js'
 
-const PORT = process.env.PORT ? parseInt(process.env.PORT) : await getPortPromise()
-const DB_NAME = process.argv[2]
+// PORT must be provided by cluster manager via environment variable
+if (!process.env.PORT) {
+  console.error('ERROR: PORT environment variable is required when running as cluster worker')
+  process.exit(1)
+}
+
+const PORT = parseInt(process.env.PORT)
+const DB_NAME = process.argv[2] || process.env.DB_NAME
 const PARTITION = process.env.PARTITION || DB_NAME.replace('.db', '')
-const CONSUL_HOST = process.env.CONSUL_HOST || 'localhost'
-const CONSUL_PORT = process.env.CONSUL_PORT || 8500
 const HOST_NAME = hostname()
 // Service name includes partition for DNS lookup
-const SERVICE_NAME = `api-server-${PARTITION}`
+const SERVICE_NAME = SERVICE_NAME_TEMPLATE(PARTITION)
 const SERVICE_ID = `${SERVICE_NAME}-${HOST_NAME}-${PORT}`
 
+const logger = createLogger(`API-SERVER-${PARTITION}`, `api_server_${PARTITION}_${pid}.log`)
 const db_dao = new SqliteDAO(DB_NAME)
 
 // Initialize Consul client
-const consul = new Consul({
-  host: CONSUL_HOST,
-  port: CONSUL_PORT,
-  promisify: true
-})
+const consul = createConsulClient()
 
 const server = createServer(async (req, res) => {
   // Health check endpoint for Consul
@@ -64,75 +65,72 @@ const server = createServer(async (req, res) => {
   }
 
   const letter = req.url.split('/').at(-1)
-  console.log(`[WORKER: ${pid}] Fetching people with last name starting with A.`)
+  logger.info(`[PID ${pid}:${PORT}] Fetching people with last name starting with ${letter}`)
   try {
     const people = await db_dao.all(
       'SELECT * FROM people WHERE lastName LIKE ?',
       [`${letter}%`]
     )
 
+    logger.info(`[PID ${pid}:${PORT}] Returning ${people.length} results for letter ${letter}`)
     res.writeHead(200, { 'Content-Type': 'application/json' })
     res.end(JSON.stringify(people))
   } catch (err) {
-    console.error('Database error:', err)
+    logger.error(`[PID ${pid}:${PORT}] Database error:`, err)
     res.writeHead(500, { 'Content-Type': 'application/json' })
     res.end(JSON.stringify({ error: 'Database error' }))
   }
 })
 
 server.on('error', (err)=>{
-  console.log(err)
+  logger.error(`[PID ${pid}:${PORT}] Server error:`, err)
 })
 
 server.listen(PORT, async () => {
-  console.log(`Server listening on http://localhost:${PORT}`)
-  console.log(`Database: ${DB_NAME}`)
-  console.log(`Partition: ${PARTITION}`)
+  logger.info(`[PID ${pid}:${PORT}] Server listening on http://localhost:${PORT}`)
+  logger.info(`[PID ${pid}:${PORT}] Database: ${DB_NAME}`)
+  logger.info(`[PID ${pid}:${PORT}] Partition: ${PARTITION}`)
 
   // Register service with Consul
   const serviceAddress = hostname()
 
   try {
-    await consul.agent.service.register({
+    await registerService(consul, {
       id: SERVICE_ID,
-      name: SERVICE_NAME,  // Each partition is a separate service
+      name: SERVICE_NAME,
       address: serviceAddress,
       port: PORT,
       meta: {
         partition: PARTITION,
         database: DB_NAME
       },
-      check: {
-        http: `http://${serviceAddress}:${PORT}/health`,
-        interval: '10s',
-        timeout: '5s'
-      }
+      healthCheckPath: '/health'
     })
-    console.log(`Registered with Consul as ${SERVICE_NAME} (ID: ${SERVICE_ID}) at ${serviceAddress}:${PORT}`)
+    logger.info(`[PID ${pid}:${PORT}] Registered with Consul as ${SERVICE_NAME} (ID: ${SERVICE_ID}) at ${serviceAddress}:${PORT}`)
 
-    // Notify parent process that we're ready (if spawned by auto_scaler)
+    // Notify parent process that we're ready (if spawned by cluster manager)
     if (process.send) {
       process.send('ready')
     }
   } catch (err) {
-    console.error('Failed to register with Consul:', err)
+    logger.error(`[PID ${pid}:${PORT}] Failed to register with Consul:`, err)
     process.exit(1)
   }
 })
 
 // Graceful shutdown
 async function shutdown() {
-  console.log('\nShutting down...')
+  logger.info(`[PID ${pid}:${PORT}] Shutting down...`)
 
   try {
-    await consul.agent.service.deregister(SERVICE_ID)
-    console.log('Deregistered from Consul')
+    await deregisterService(consul, SERVICE_ID)
+    logger.info(`[PID ${pid}:${PORT}] Deregistered from Consul`)
   } catch (err) {
-    console.error('Error deregistering from Consul:', err)
+    logger.error(`[PID ${pid}:${PORT}] Error deregistering from Consul:`, err)
   }
 
   server.close(() => {
-    console.log('Server closed')
+    logger.info(`[PID ${pid}:${PORT}] Server closed`)
     process.exit(0)
   })
 }
